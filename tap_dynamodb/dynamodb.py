@@ -64,7 +64,7 @@ def setup_aws_client(config):
         )
 
         LOGGER.info("Attempting to assume_role on RoleArn: %s", role_arn)
-        boto3.setup_default_session(botocore_session=refreshable_session)
+        return boto3.setup_default_session(botocore_session=refreshable_session)
     
     if 'aws_access_key_id' in config and 'aws_secret_access_key' in config:
         return boto3.client('dynamodb', aws_access_key_id=config['aws_access_key_id'], aws_secret_access_key=config['aws_secret_access_key'], region_name=config['region_name'])
