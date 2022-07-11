@@ -38,7 +38,11 @@ def discover_streams(config):
     except ClientError:
         raise Exception("Authorization to AWS failed. Please ensure the role and policy are configured correctly on your AWS account.")
 
+    LOGGER.info(f'Response from dynamo get table: {response}')
+
     table_list = response.get('TableNames')
+
+    LOGGER.info(f'Table list: {table_list}')
 
     while response.get('LastEvaluatedTableName') is not None:
         response = client.list_tables(ExclusiveStartTableName=response.get('LastEvaluatedTableName'))
@@ -47,6 +51,8 @@ def discover_streams(config):
     streams = [x for x in
                (discover_table_schema(client, table) for table in table_list)
                if x is not None]
+
+    LOGGER.info(f'Streams: {streams}')
 
 
     return streams
