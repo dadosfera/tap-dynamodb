@@ -6,7 +6,7 @@ from terminaltables import AsciiTable
 import singer
 from singer import metadata
 from tap_dynamodb.discover import discover_streams
-# from tap_dynamodb.dynamodb import setup_aws_client
+from tap_dynamodb.dynamodb import setup_aws_client
 from tap_dynamodb.sync import sync_stream
 
 
@@ -84,8 +84,8 @@ def main():
     config = args.config
 
     # # TODO Is this the right way to do this? It seems bad
-    # if not config.get('use_local_dynamo'):
-    #     setup_aws_client(config)
+    if not config.get('use_local_dynamo'):
+        setup_aws_client(config)
 
     if args.discover:
         do_discover(args.config)
