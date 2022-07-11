@@ -1,15 +1,11 @@
 from singer import metadata
 import singer
-import backoff
-from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError
+from botocore.exceptions import ClientError
 from tap_dynamodb import dynamodb
 
 LOGGER = singer.get_logger()
 
 def discover_table_schema(client, table_name):
-    '''
-    For each of the tables in the dynamodb, create the table schema for the catalog
-    '''
     try:
         table_info = client.describe_table(TableName=table_name).get('Table', {})
     except ClientError:
@@ -33,15 +29,8 @@ def discover_table_schema(client, table_name):
         }
     }
 
-# Backoff for both ReadTimeout and ConnectTimeout error for 5 times
-@backoff.on_exception(backoff.expo,
-                    (ReadTimeoutError, ConnectTimeoutError),
-                    max_tries=5,
-                    factor=2)
+
 def discover_streams(config):
-    '''
-    Get the list of the tables and create the table schema for each of them
-    '''
     client = dynamodb.get_client(config)
 
     try:

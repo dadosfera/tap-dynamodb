@@ -1,26 +1,16 @@
-import datetime
+import boto3
 from singer import metadata
 import singer
-import backoff
-from botocore.exceptions import ConnectTimeoutError, ReadTimeoutError
-from tap_dynamodb import dynamodb, deserialize
+
+from tap_dynamodb import dynamodb
+from tap_dynamodb import deserialize
 
 LOGGER = singer.get_logger()
 WRITE_STATE_PERIOD = 1000
 
 SDC_DELETED_AT = "_sdc_deleted_at"
-MAX_TRIES = 5
-FACTOR = 2
 
-def get_shards(streams_client, stream_arn):
-    '''
-    Yields closed shards.
-
-    We only yield closed shards because it is
-    impossible to tell if an open shard has any more records or if you
-    will infinitely loop over the lastEvaluatedShardId
-    '''
-
+def get_shards(streams_client, stream_arn, open_shards_only=False):
     params = {
         'StreamArn': stream_arn
     }
@@ -31,11 +21,10 @@ def get_shards(streams_client, stream_arn):
         stream_info = streams_client.describe_stream(**params)['StreamDescription']
 
         for shard in stream_info['Shards']:
-            # See
-            # https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_streams_DescribeStream.html
-            # for documentation on how to identify closed shards
-            # Closed shards all have an EndingSequenceNumber
-            if shard['SequenceNumberRange'].get('EndingSequenceNumber'):
+            if open_shards_only:
+                if not shard['SequenceNumberRange'].get('EndingSequenceNumber'):
+                    yield shard
+            else:
                 yield shard
 
         last_evaluated_shard_id = stream_info.get('LastEvaluatedShardId')
@@ -45,45 +34,68 @@ def get_shards(streams_client, stream_arn):
             params['ExclusiveStartShardId'] = last_evaluated_shard_id
 
 
-def get_shard_records(streams_client, stream_arn, shard, sequence_number):
-    '''
-    This should only be called on closed shards. Calling this on an open
-    shard will lead to an infinite loop
-
-    Yields the records on a shard.
-    '''
-    if sequence_number:
-        iterator_type = 'AFTER_SEQUENCE_NUMBER'
-    else:
-        iterator_type = 'TRIM_HORIZON'
-
+def get_shard_records(streams_client, stream_arn, shard, shard_iterator_type, sequence_number = ''):
     params = {
         'StreamArn': stream_arn,
         'ShardId': shard['ShardId'],
-        'ShardIteratorType': iterator_type
+        'ShardIteratorType': shard_iterator_type
     }
 
-    if sequence_number:
+    if shard_iterator_type == 'AFTER_SEQUENCE_NUMBER':
         params['SequenceNumber'] = sequence_number
 
     shard_iterator = streams_client.get_shard_iterator(**params)['ShardIterator']
 
-    # This will loop indefinitely if called on open shards
-    while shard_iterator:
-        records = streams_client.get_records(ShardIterator=shard_iterator, Limit=1000)
+    limit = 1000
+    has_more = True
+
+    while has_more:
+
+        records = streams_client.get_records(ShardIterator=shard_iterator, Limit=limit)
 
         for record in records['Records']:
             yield record
 
         shard_iterator = records.get('NextShardIterator')
 
+        has_more = len(records['Records']) == limit and records.get('NextShardIterator')
+
+def get_latest_seq_numbers(config, stream):
+    '''
+    returns {shardId: sequence_number}
+    '''
+
+    client = dynamodb.get_client(config)
+    streams_client = dynamodb.get_stream_client(config)
+    table_name = stream['tap_stream_id']
+
+    table = client.describe_table(TableName=table_name)['Table']
+    stream_arn = table['LatestStreamArn']
+
+    sequence_number_bookmarks = {}
+    LOGGER.info('Retreiving records from stream %s', stream_arn)
+    for shard in get_shards(streams_client, stream_arn, True):
+        LOGGER.info('\tRetreiving records from shard %s', shard['ShardId'])
+        has_records = False
+        for record in get_shard_records(streams_client, stream_arn, shard, 'TRIM_HORIZON'):
+            has_records = True
+            # Get the final record
+        if has_records:
+            sequence_number_bookmarks[shard['ShardId']] = record['dynamodb']['SequenceNumber']
+
+    return sequence_number_bookmarks
+
 
 def sync_shard(shard, seq_number_bookmarks, streams_client, stream_arn, projection, deserializer, table_name, stream_version, state):
     seq_number = seq_number_bookmarks.get(shard['ShardId'])
+    if seq_number:
+        iterator_type = 'AFTER_SEQUENCE_NUMBER'
+    else:
+        iterator_type = 'TRIM_HORIZON'
 
     rows_synced = 0
 
-    for record in get_shard_records(streams_client, stream_arn, shard, seq_number):
+    for record in get_shard_records(streams_client, stream_arn, shard, iterator_type, seq_number):
         if record['eventName'] == 'REMOVE':
             record_message = deserializer.deserialize_item(record['dynamodb']['Keys'])
             record_message[SDC_DELETED_AT] = singer.utils.strftime(record['dynamodb']['ApproximateCreationDateTime'])
@@ -92,7 +104,7 @@ def sync_shard(shard, seq_number_bookmarks, streams_client, stream_arn, projecti
             if record_message is None:
                 LOGGER.fatal('Dynamo stream view type must be either "NEW_IMAGE" "NEW_AND_OLD_IMAGES"')
                 raise RuntimeError('Dynamo stream view type must be either "NEW_IMAGE" "NEW_AND_OLD_IMAGES"')
-            if projection is not None and projection != '':
+            if projection is not None:
                 try:
                     record_message = deserializer.apply_projection(record_message, projection)
                 except:
@@ -100,8 +112,8 @@ def sync_shard(shard, seq_number_bookmarks, streams_client, stream_arn, projecti
                     raise RuntimeError('Projection failed to apply: {}'.format(projection))
 
         record_message = singer.RecordMessage(stream=table_name,
-                                              record=record_message,
-                                              version=stream_version)
+                                            record=record_message,
+                                            version=stream_version)
         singer.write_message(record_message)
 
         rows_synced += 1
@@ -109,41 +121,13 @@ def sync_shard(shard, seq_number_bookmarks, streams_client, stream_arn, projecti
         seq_number_bookmarks[shard['ShardId']] = record['dynamodb']['SequenceNumber']
         state = singer.write_bookmark(state, table_name, 'shard_seq_numbers', seq_number_bookmarks)
 
-        # Every 100 rows write the state
-        if rows_synced % 100 == 0:
-            singer.write_state(state)
+    if rows_synced > 0:
+        singer.write_state(state)
 
-    singer.write_state(state)
     return rows_synced
 
-def prepare_projection(projection, expression, exp_key_traverse):
-    '''
-    Prepare the projection based on the expression attributes
-    For example:
-    projections = "#c", expressions = {"#c": "Comment"}
-    return = ["Comment"]
-    Example of nested expression :
-    In Catalog - projections = "#n[0].#a", expressions = {"#n": "Name", "#a": "Age"}
-    projection passed in the function = ['#n[0]', '#a']
-    projection returned from the function = ['Name[0]', 'Age']
-    '''
-    for index, part in enumerate(projection):
-        if '#' in part:
-            replaceable_part = part.split('[', 1)[0] if '[' in part else part
-            # check if the projection placeholder is defined in the expression else raise an exception
-            if replaceable_part in expression:
-                exp_key_traverse.discard(replaceable_part)
-                # replace the value given in the expression with the key in the projection
-                projection[index] = part.replace(replaceable_part, expression[replaceable_part])
-            else:
-                raise Exception("No expression is available for the given projection: {}.".format(replaceable_part))
 
-# Backoff for both ReadTimeout and ConnectTimeout error for 5 times
-@backoff.on_exception(backoff.expo,
-                      (ReadTimeoutError, ConnectTimeoutError),
-                      max_tries=MAX_TRIES,
-                      factor=FACTOR)
-def sync(config, state, stream):
+def sync_log_based(config, state, stream):
     table_name = stream['tap_stream_id']
 
     client = dynamodb.get_client(config)
@@ -151,26 +135,9 @@ def sync(config, state, stream):
 
     md_map = metadata.to_map(stream['metadata'])
     projection = metadata.get(md_map, (), 'tap-mongodb.projection')
-    expression = metadata.get(md_map, (), 'tap-dynamodb.expression-attributes')
     if projection is not None:
         projection = [x.strip().split('.') for x in projection.split(',')]
-        if expression:
-            # decode the expression in jsonified object.
-            expression = dynamodb.decode_expression(expression)
-            # loop over the expression keys
-            for expr in expression.keys():
-                # check if the expression key starts with `#` and if not raise an exception
-                if not expr[0].startswith("#"):
-                    raise Exception("Expression key '{}' must start with '#'.".format(expr))
 
-            # A set to check all the expression keys are used in the projections or not.
-            exp_key_traverse = set(expression.keys())
-
-            for proj in projection:
-                prepare_projection(proj, expression, exp_key_traverse)
-
-            if exp_key_traverse:
-                raise Exception("No projection is available for the expression keys: {}.".format(exp_key_traverse))
     # Write activate version message
     stream_version = singer.get_bookmark(state, table_name, 'version')
     singer.write_version(table_name, stream_version)
@@ -179,18 +146,16 @@ def sync(config, state, stream):
     stream_arn = table['LatestStreamArn']
 
     # Stores a dictionary of shardId : sequence_number for a shard. Should
-    # only store sequence numbers for closed shards that have not been
-    # fully synced
+    # only store sequence numbers for open shards, as closed shards should
+    # be put into finished_shard_bookmarks
     seq_number_bookmarks = singer.get_bookmark(state, table_name, 'shard_seq_numbers')
-    if not seq_number_bookmarks:
-        seq_number_bookmarks = {}
 
-    # Get the list of closed shards which we have fully synced. These
+    # Store the list of closed shards which we have fully synced. These
     # are removed after performing a sync and not seeing the shardId
     # returned by get_shards() because at that point the shard has been
     # killed by DynamoDB and will not be returned anymore
     finished_shard_bookmarks = singer.get_bookmark(state, table_name, 'finished_shards')
-    if not finished_shard_bookmarks:
+    if finished_shard_bookmarks is None:
         finished_shard_bookmarks = []
 
     # The list of shardIds we found this sync. Is used to determine which
@@ -209,74 +174,63 @@ def sync(config, state, stream):
                                       streams_client, stream_arn, projection, deserializer,
                                       table_name, stream_version, state)
 
-        # Now that we have fully synced the shard, move it from the
-        # shard_seq_numbers to finished_shards.
-        finished_shard_bookmarks.append(shard['ShardId'])
-        state = singer.write_bookmark(state, table_name, 'finished_shards', finished_shard_bookmarks)
+        # If the shard we just finished syncing is closed (i.e. has an
+        # EndingSequenceNumber), remove it from the seq_number_bookmark
+        # and put it into the finished_shards bookmark
+        if shard['SequenceNumberRange'].get('EndingSequenceNumber'):
+            # Must check if the bookmark exists because if a shard has 0
+            # records we will never set a bookmark for the shard
+            if seq_number_bookmarks.get(shard['ShardId']):
+                seq_number_bookmarks.pop(shard['ShardId'])
+                finished_shard_bookmarks.append(shard['ShardId'])
+                state = singer.write_bookmark(state, table_name, 'finished_shards', finished_shard_bookmarks)
+                state = singer.write_bookmark(state, table_name, 'shard_seq_numbers', seq_number_bookmarks)
+                singer.write_state(state)
 
-        if seq_number_bookmarks.get(shard['ShardId']):
-            seq_number_bookmarks.pop(shard['ShardId'])
-            state = singer.write_bookmark(state, table_name, 'shard_seq_numbers', seq_number_bookmarks)
-
-        singer.write_state(state)
-
-    for shardId in finished_shard_bookmarks:
-        if shardId not in found_shards:
+    for shard in finished_shard_bookmarks:
+        if shard not in found_shards:
             # Remove this shard because its no longer appearing when we query for get_shards
-            finished_shard_bookmarks.remove(shardId)
+            finished_shard_bookmarks.remove(shard)
             state = singer.write_bookmark(state, table_name, 'finished_shards', finished_shard_bookmarks)
 
     singer.write_state(state)
 
     return rows_synced
 
-
-def has_stream_aged_out(state, table_name):
-    '''
-    Uses the success_timestamp on the stream to determine if we have
-    successfully synced the stream in the last 19 hours 30 minutes.
-
-    This uses 19 hours and 30 minutes because records are guaranteed to be
-    available on a shard for 24 hours, but we only process closed shards
-    and shards close after 4 hours. 24-4 = 20 and we gave 30 minutes of
-    wiggle room because I don't trust AWS.
-    See https://aws.amazon.com/blogs/database/dynamodb-streams-use-cases-and-design-patterns/
-    '''
-    current_time = singer.utils.now()
-
-    success_timestamp = singer.get_bookmark(state, table_name, 'success_timestamp')
-
-    # If we have no success_timestamp then we have aged out
-    if not success_timestamp:
-        return True
-
-    time_span = current_time - singer.utils.strptime_to_utc(success_timestamp)
-
-    # If it has been > than 19h30m since the last successful sync of this
-    # stream then we consider the stream to be aged out
-    return time_span > datetime.timedelta(hours=19, minutes=30)
-
-# Backoff for both ReadTimeout and ConnectTimeout error for 5 times
-@backoff.on_exception(backoff.expo,
-                      (ReadTimeoutError, ConnectTimeoutError),
-                      max_tries=MAX_TRIES,
-                      factor=FACTOR)
-def get_initial_bookmarks(config, state, table_name):
-    '''
-    Returns the state including all bookmarks necessary for the initial
-    full table sync
-    '''
-    # TODO This can be improved by getting the max sequence number in the
-    # open shards and include those in the seq_number bookmark
-
-
+def has_stream_aged_out(config, state, stream):
     client = dynamodb.get_client(config)
     streams_client = dynamodb.get_stream_client(config)
-
-    table = client.describe_table(TableName=table_name)['Table']
+    table = client.describe_table(TableName=stream['tap_stream_id'])['Table']
     stream_arn = table['LatestStreamArn']
 
-    finished_shard_bookmarks = [shard['ShardId'] for shard in get_shards(streams_client, stream_arn)]
-    state = singer.write_bookmark(state, table_name, 'finished_shards', finished_shard_bookmarks)
+    seq_number_bookmarks = singer.get_bookmark(state, stream['tap_stream_id'], 'shard_seq_numbers')
 
-    return state
+    # If we do not have sequence number bookmarks then check the
+    # finished_shard bookmark and see if we have any of the previously
+    # finished shards still being returned by DynamoDB. If we do then we
+    # have not yet aged out
+    if seq_number_bookmarks is None or seq_number_bookmarks == {}:
+        # If we have only closed shard bookmarks and one of those shards
+        # are returned to us by get_shards then we have not missed any
+        # records
+        finished_shard_bookmarks = singer.get_bookmark(state, stream['tap_stream_id'], 'finished_shards')
+        if finished_shard_bookmarks is None:
+           return True
+
+        closed_shards =  (x['ShardId'] for x in get_shards(streams_client, stream_arn) if x['SequenceNumberRange'].get('EndingSequenceNumber', False))
+
+        for shard in closed_shards:
+            if shard in finished_shard_bookmarks:
+                return False
+        return True
+    else:
+        # If we have a bookmark for an open shard and that shard is not
+        # returned to us by DynamoDB then we have missed the remainder of
+        # the shard. Similarly if the shard's earliest sequence number is
+        # after our bookmark then we have missed records on the shard
+        shard_beg_seq_num =  {x['ShardId']: x['SequenceNumberRange']['StartingSequenceNumber'] for x in get_shards(streams_client, stream_arn)}
+
+        for shard_id, shard_bookmark in seq_number_bookmarks.items():
+            if shard_beg_seq_num.get(shard_id) is None or shard_beg_seq_num[shard_id] > shard_bookmark:
+                return True
+        return False
