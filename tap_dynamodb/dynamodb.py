@@ -74,9 +74,10 @@ def get_client(config):
         return boto3.client('dynamodb',
                             endpoint_url='http://localhost:8000',
                             region_name=config['region_name'])
-    
-    client = setup_aws_client(config)
-    return client
+    if 'aws_access_key_id' in config and 'aws_secret_access_key' in config:
+        return boto3.client('dynamodb', aws_access_key_id=config['aws_access_key_id'], aws_secret_access_key=config['aws_secret_access_key'], region_name=config['region_name'])
+    if 'role_name' in config:
+        return boto3.client('dynamodb', config['region_name'])
 
 def get_stream_client(config):
     if config.get('use_local_dynamo'):
