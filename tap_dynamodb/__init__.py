@@ -80,11 +80,8 @@ def get_sync_summary(catalog, counts, times):
 
 @singer.utils.handle_top_exception(LOGGER)
 def main():
-    LOGGER.info(f"Chaves obrigatorias: {REQUIRED_CONFIG_KEYS}")
     args = singer.utils.parse_args(REQUIRED_CONFIG_KEYS)
-    LOGGER.info(f"Arguments: {args}")
     config = args.config
-    LOGGER.info(f"Config: {config}")
 
     # TODO Is this the right way to do this? It seems bad
     if not config.get('use_local_dynamo'):
